@@ -1,0 +1,678 @@
+-- Add SQL execution log table to the framework
+CREATE OR REPLACE TABLE `project_id.framework_dataset.sql_execution_log` (
+  execution_id STRING NOT NULL,
+  batch_id STRING NOT NULL,
+  target_table STRING NOT NULL,
+  process_type STRING NOT NULL,
+  step_name STRING NOT NULL,
+  sql_statement STRING NOT NULL,
+  execution_started TIMESTAMP NOT NULL,
+  execution_completed TIMESTAMP,
+  execution_time_ms INT64,
+  execution_status STRING,
+  rows_affected INT64,
+  error_message STRING,
+  PRIMARY KEY(execution_id)
+);
+
+-- Enhanced stored procedure with SQL logging
+CREATE OR REPLACE PROCEDURE `project_id.framework_dataset.process_scd_type2`(
+  target_table STRING,
+  source_query STRING,
+  identifier_field STRING,
+  hash_fields ARRAY<STRING>,
+  process_type STRING DEFAULT 'DELTA',
+  debug_mode BOOL DEFAULT FALSE
+)
+BEGIN
+  -- Declare variables
+  DECLARE batch_id STRING DEFAULT FORMAT_TIMESTAMP('%Y%m%d%H%M%S', CURRENT_TIMESTAMP());
+  DECLARE process_id STRING DEFAULT CONCAT(target_table, '_', batch_id);
+  DECLARE last_run_timestamp TIMESTAMP;
+  DECLARE delta_threshold DATETIME;
+  DECLARE infinity_date STRING DEFAULT '9999-12-31T23:59:59';
+  DECLARE start_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP();
+  DECLARE records_processed INT64 DEFAULT 0;
+  DECLARE records_inserted INT64 DEFAULT 0;
+  DECLARE records_updated INT64 DEFAULT 0;
+  DECLARE records_unchanged INT64 DEFAULT 0;
+  DECLARE entity_type STRING DEFAULT SPLIT(target_table, '.')[SAFE_OFFSET(2)];
+  DECLARE source_query_with_filter STRING;
+  
+  -- For SQL logging
+  DECLARE execution_id STRING;
+  DECLARE step_start_time TIMESTAMP;
+  DECLARE step_sql STRING;
+  DECLARE step_name STRING;
+  DECLARE rows_affected INT64;
+  
+  -- Create array to hold SQL statements for debug mode
+  DECLARE executed_statements ARRAY<STRUCT<step STRING, sql STRING>>;
+  SET executed_statements = [];
+  
+  -- Helper function to log SQL execution
+  CREATE TEMP FUNCTION log_sql_execution(step STRING, sql STRING) RETURNS STRING AS (
+    (
+      SELECT 
+        CONCAT(process_id, '_', CAST(UNIX_MICROS(CURRENT_TIMESTAMP()) AS STRING))
+    )
+  );
+  
+  -- Helper function to start SQL logging
+  CREATE TEMP FUNCTION start_sql_step(step STRING, sql STRING) RETURNS STRUCT<execution_id STRING, start_time TIMESTAMP> AS (
+    STRUCT(
+      log_sql_execution(step, sql),
+      CURRENT_TIMESTAMP()
+    )
+  );
+  
+  -- Helper function to complete SQL logging
+  CREATE TEMP FUNCTION complete_sql_step(execution_id STRING, start_time TIMESTAMP, status STRING, rows INT64, error STRING) RETURNS BOOL AS (
+    TRUE
+  );
+
+  -- Log the process start
+  IF debug_mode THEN
+    SET executed_statements = ARRAY_CONCAT(executed_statements, 
+      [STRUCT<step STRING, sql STRING>('PROCESS START', 
+        CONCAT('/* Starting SCD Type 2 processing for table: ', target_table, 
+               ' with process_type: ', process_type, ' */'))]
+    );
+  END IF;
+  
+  -- Initialize log record
+  SET step_name = 'INITIALIZE_LOG';
+  SET step_sql = CONCAT(
+    "INSERT INTO `project_id.framework_dataset.process_log` ",
+    "(process_id, target_table, batch_id, process_type, last_processed_timestamp, started_at, status, created_by) ",
+    "VALUES ('", process_id, "', '", target_table, "', '", batch_id, "', '", 
+            process_type, "', DATETIME('2000-01-01T00:00:00'), TIMESTAMP('", start_time, "'), 'RUNNING', SESSION_USER());"
+  );
+  
+  IF debug_mode THEN
+    SET executed_statements = ARRAY_CONCAT(executed_statements, [STRUCT(step_name, step_sql)]);
+  ELSE
+    -- Log SQL execution start
+    SET execution_id = log_sql_execution(step_name, step_sql);
+    SET step_start_time = CURRENT_TIMESTAMP();
+    
+    INSERT INTO `project_id.framework_dataset.sql_execution_log`
+      (execution_id, batch_id, target_table, process_type, step_name, sql_statement, execution_started)
+    VALUES
+      (execution_id, batch_id, target_table, process_type, step_name, step_sql, step_start_time);
+  END IF;
+  
+  -- Execute the SQL
+  IF NOT debug_mode THEN
+    INSERT INTO `project_id.framework_dataset.process_log`
+      (process_id, target_table, batch_id, process_type, last_processed_timestamp, started_at, status, created_by)
+    VALUES
+      (process_id, target_table, batch_id, process_type, DATETIME('2000-01-01T00:00:00'), start_time, 'RUNNING', SESSION_USER());
+    
+    -- Log SQL execution completion
+    SET rows_affected = @@row_count;
+    
+    UPDATE `project_id.framework_dataset.sql_execution_log`
+    SET 
+      execution_completed = CURRENT_TIMESTAMP(),
+      execution_time_ms = TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), step_start_time, MILLISECOND),
+      execution_status = 'SUCCESS',
+      rows_affected = rows_affected
+    WHERE execution_id = execution_id;
+  END IF;
+  
+  -- Get last processing timestamp for this target
+  SET step_name = 'GET_LAST_TIMESTAMP';
+  SET step_sql = CONCAT(
+    "SELECT TIMESTAMP(last_processed_timestamp) ",
+    "FROM `project_id.framework_dataset.process_log` ",
+    "WHERE target_table = '", target_table, "' ",
+    "AND status = 'SUCCESS' ",
+    "ORDER BY started_at DESC ",
+    "LIMIT 1"
+  );
+  
+  IF debug_mode THEN
+    SET executed_statements = ARRAY_CONCAT(executed_statements, [STRUCT(step_name, step_sql)]);
+  ELSE
+    -- Log SQL execution start
+    SET execution_id = log_sql_execution(step_name, step_sql);
+    SET step_start_time = CURRENT_TIMESTAMP();
+    
+    INSERT INTO `project_id.framework_dataset.sql_execution_log`
+      (execution_id, batch_id, target_table, process_type, step_name, sql_statement, execution_started)
+    VALUES
+      (execution_id, batch_id, target_table, process_type, step_name, step_sql, step_start_time);
+  END IF;
+  
+  -- Execute the SQL
+  IF NOT debug_mode THEN
+    SET last_run_timestamp = (
+      SELECT TIMESTAMP(last_processed_timestamp)
+      FROM `project_id.framework_dataset.process_log`
+      WHERE target_table = target_table
+      AND status = 'SUCCESS'
+      ORDER BY started_at DESC
+      LIMIT 1
+    );
+    
+    -- Log SQL execution completion
+    UPDATE `project_id.framework_dataset.sql_execution_log`
+    SET 
+      execution_completed = CURRENT_TIMESTAMP(),
+      execution_time_ms = TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), step_start_time, MILLISECOND),
+      execution_status = 'SUCCESS'
+    WHERE execution_id = execution_id;
+  END IF;
+  
+  -- If no successful run found, use epoch start
+  IF last_run_timestamp IS NULL OR debug_mode THEN
+    SET last_run_timestamp = TIMESTAMP('2000-01-01T00:00:00');
+  END IF;
+  
+  -- Convert to DATETIME for comparison
+  SET delta_threshold = DATETIME(last_run_timestamp);
+  
+  -- Add delta filter if required
+  SET step_name = 'PREPARE_SOURCE_QUERY';
+  IF process_type = 'DELTA' THEN
+    SET source_query_with_filter = CONCAT(
+      "WITH filtered_source AS (", source_query, ") ",
+      "SELECT * FROM filtered_source ",
+      "WHERE DATETIME(EFFECTIVE_FROM_DATE) >= '", delta_threshold, "' ",
+      "OR (EFFECTIVE_TO_DATE != '", infinity_date, "' AND DATETIME(EFFECTIVE_TO_DATE) >= '", delta_threshold, "')"
+    );
+  ELSE
+    SET source_query_with_filter = source_query;
+  END IF;
+  
+  IF debug_mode THEN
+    SET executed_statements = ARRAY_CONCAT(executed_statements, 
+      [STRUCT(step_name, CONCAT('/* Applied filter for process_type: ', process_type, ' */\n', source_query_with_filter))]);
+  END IF;
+  
+  -- Create runtime query for source data with dynamic fields
+  SET step_name = 'PREPARE_STAGING_INSERT';
+  SET step_sql = CONCAT(
+    -- Clear staging table for this target
+    "DELETE FROM `project_id.framework_dataset.scd_staging` WHERE target_table = '", target_table, "' AND batch_id = '", batch_id, "'; ",
+    
+    -- Execute dynamic source query and process into staging
+    "INSERT INTO `project_id.framework_dataset.scd_staging` ",
+    "WITH source_data AS (", source_query_with_filter, "), ",
+    
+    -- Get current target data
+    "target_current AS ( ",
+    "  SELECT ",
+    "    entity_id, ",
+    "    source_key, ",
+    "    record_hash, ",
+    "    effective_from_date, ",
+    "    effective_to_date, ",
+    "    ROW_NUMBER() OVER(PARTITION BY entity_id ORDER BY effective_from_date DESC) as rn ",
+    "  FROM `", target_table, "` ",
+    "  WHERE effective_to_date = TIMESTAMP('", infinity_date, "') ",
+    "), ",
+    
+    -- Add entity identifiers (existing or new)
+    "source_with_identifiers AS ( ",
+    "  SELECT ",
+    "    s.*, ",
+    "    COALESCE(e.target_identifier, ",
+    "      (SELECT COALESCE(MAX(target_identifier), 0) + ROW_NUMBER() OVER(ORDER BY ", identifier_field, ") ",
+    "       FROM `project_id.framework_dataset.entity_identifier_map` ",
+    "       WHERE entity_type = '", entity_type, "')) AS entity_id ",
+    "  FROM source_data s ",
+    "  LEFT JOIN `project_id.framework_dataset.entity_identifier_map` e ",
+    "    ON e.entity_type = '", entity_type, "' ",
+    "    AND e.source_key = s.", identifier_field, " ",
+    "), ",
+    
+    -- Calculate hash and create JSON
+    "source_prepared AS ( ",
+    "  SELECT ",
+    "    s.entity_id, ",
+    "    s.", identifier_field, " AS source_key, ",
+    "    TO_JSON(STRUCT(", 
+    STRING_AGG(CONCAT("s.", h), ', ') OVER(), -- concatenate all hash fields
+    "    )) AS attributes, ",
+    "    SHA256(CONCAT(", 
+    STRING_AGG(CONCAT("COALESCE(CAST(s.", h, " AS STRING), 'null')"), ",'|'") OVER(), -- hash concatenation 
+    "    )) AS record_hash, ",
+    "    s.EFFECTIVE_FROM_DATE, ",
+    "    s.EFFECTIVE_TO_DATE ",
+    "  FROM source_with_identifiers s ",
+    ") ",
+    
+    -- Final staging insert with action determination
+    "SELECT ",
+    "  '", target_table, "' AS target_table, ",
+    "  '", batch_id, "' AS batch_id, ",
+    "  s.entity_id, ",
+    "  s.source_key, ",
+    "  'SOURCE_SYSTEM' AS source_system, ",
+    "  s.attributes, ",
+    "  s.record_hash, ",
+    "  CASE ",
+    "    WHEN t.entity_id IS NULL THEN s.EFFECTIVE_FROM_DATE ",
+    "    WHEN t.record_hash != s.record_hash THEN TIMESTAMP(FORMAT_DATE('%F', CURRENT_DATE()) || 'T00:00:00') ",
+    "    ELSE t.effective_from_date ",
+    "  END AS effective_from_date, ",
+    "  TIMESTAMP('", infinity_date, "') AS effective_to_date, ",
+    "  CASE ",
+    "    WHEN t.entity_id IS NULL THEN 'INSERT' ",
+    "    WHEN t.record_hash != s.record_hash THEN 'UPDATE' ",
+    "    ELSE 'UNCHANGED' ",
+    "  END AS action, ",
+    "  t.record_hash AS existing_record_hash, ",
+    "  CURRENT_TIMESTAMP() AS load_date ",
+    "FROM source_prepared s ",
+    "LEFT JOIN target_current t ",
+    "  ON s.entity_id = t.entity_id ",
+    "  AND t.rn = 1 "
+  );
+  
+  IF debug_mode THEN
+    SET executed_statements = ARRAY_CONCAT(executed_statements, [STRUCT(step_name, step_sql)]);
+  ELSE
+    -- Log SQL execution start
+    SET execution_id = log_sql_execution(step_name, step_sql);
+    SET step_start_time = CURRENT_TIMESTAMP();
+    
+    INSERT INTO `project_id.framework_dataset.sql_execution_log`
+      (execution_id, batch_id, target_table, process_type, step_name, sql_statement, execution_started)
+    VALUES
+      (execution_id, batch_id, target_table, process_type, step_name, step_sql, step_start_time);
+    
+    -- Execute the SQL (using the hash_fields parameter)
+    EXECUTE IMMEDIATE step_sql USING (hash_fields);
+    
+    -- Log SQL execution completion
+    SET rows_affected = @@row_count;
+    
+    UPDATE `project_id.framework_dataset.sql_execution_log`
+    SET 
+      execution_completed = CURRENT_TIMESTAMP(),
+      execution_time_ms = TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), step_start_time, MILLISECOND),
+      execution_status = 'SUCCESS',
+      rows_affected = rows_affected
+    WHERE execution_id = execution_id;
+  END IF;
+  
+  -- Insert new entity mappings
+  SET step_name = 'INSERT_NEW_MAPPINGS';
+  SET step_sql = CONCAT(
+    "INSERT INTO `project_id.framework_dataset.entity_identifier_map` (entity_type, source_key, target_identifier, created_timestamp) ",
+    "SELECT DISTINCT '", entity_type, "', source_key, entity_id, CURRENT_TIMESTAMP() ",
+    "FROM `project_id.framework_dataset.scd_staging` s ",
+    "WHERE s.target_table = '", target_table, "' ",
+    "AND s.batch_id = '", batch_id, "' ",
+    "AND NOT EXISTS (SELECT 1 FROM `project_id.framework_dataset.entity_identifier_map` m ",
+    "               WHERE m.entity_type = '", entity_type, "' AND m.source_key = s.source_key)"
+  );
+  
+  IF debug_mode THEN
+    SET executed_statements = ARRAY_CONCAT(executed_statements, [STRUCT(step_name, step_sql)]);
+  ELSE
+    -- Log SQL execution start
+    SET execution_id = log_sql_execution(step_name, step_sql);
+    SET step_start_time = CURRENT_TIMESTAMP();
+    
+    INSERT INTO `project_id.framework_dataset.sql_execution_log`
+      (execution_id, batch_id, target_table, process_type, step_name, sql_statement, execution_started)
+    VALUES
+      (execution_id, batch_id, target_table, process_type, step_name, step_sql, step_start_time);
+    
+    -- Execute the SQL
+    EXECUTE IMMEDIATE step_sql;
+    
+    -- Log SQL execution completion
+    SET rows_affected = @@row_count;
+    
+    UPDATE `project_id.framework_dataset.sql_execution_log`
+    SET 
+      execution_completed = CURRENT_TIMESTAMP(),
+      execution_time_ms = TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), step_start_time, MILLISECOND),
+      execution_status = 'SUCCESS',
+      rows_affected = rows_affected
+    WHERE execution_id = execution_id;
+  END IF;
+  
+  -- Count record actions
+  SET step_name = 'COUNT_RECORDS';
+  SET step_sql = CONCAT(
+    "SELECT ",
+    "  COUNT(*) AS total, ",
+    "  SUM(CASE WHEN action = 'INSERT' THEN 1 ELSE 0 END) AS inserts, ",
+    "  SUM(CASE WHEN action = 'UPDATE' THEN 1 ELSE 0 END) AS updates, ",
+    "  SUM(CASE WHEN action = 'UNCHANGED' THEN 1 ELSE 0 END) AS unchanged ",
+    "FROM `project_id.framework_dataset.scd_staging` ",
+    "WHERE target_table = '", target_table, "' AND batch_id = '", batch_id, "'"
+  );
+  
+  IF debug_mode THEN
+    SET executed_statements = ARRAY_CONCAT(executed_statements, [STRUCT(step_name, step_sql)]);
+  ELSE
+    -- Log SQL execution start
+    SET execution_id = log_sql_execution(step_name, step_sql);
+    SET step_start_time = CURRENT_TIMESTAMP();
+    
+    INSERT INTO `project_id.framework_dataset.sql_execution_log`
+      (execution_id, batch_id, target_table, process_type, step_name, sql_statement, execution_started)
+    VALUES
+      (execution_id, batch_id, target_table, process_type, step_name, step_sql, step_start_time);
+    
+    -- Execute the SQL
+    EXECUTE IMMEDIATE step_sql INTO records_processed, records_inserted, records_updated, records_unchanged;
+    
+    -- Log SQL execution completion
+    UPDATE `project_id.framework_dataset.sql_execution_log`
+    SET 
+      execution_completed = CURRENT_TIMESTAMP(),
+      execution_time_ms = TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), step_start_time, MILLISECOND),
+      execution_status = 'SUCCESS'
+    WHERE execution_id = execution_id;
+  END IF;
+  
+  -- Expire changed records
+  SET step_name = 'EXPIRE_RECORDS';
+  SET step_sql = CONCAT(
+    "UPDATE `", target_table, "` t ",
+    "SET effective_to_date = TIMESTAMP(FORMAT_DATE('%F', DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)) || 'T00:00:00') ",
+    "WHERE EXISTS (SELECT 1 FROM `project_id.framework_dataset.scd_staging` s ",
+    "              WHERE s.target_table = '", target_table, "' ",
+    "              AND s.batch_id = '", batch_id, "' ",
+    "              AND s.action = 'UPDATE' ",
+    "              AND s.entity_id = t.entity_id) ",
+    "AND t.effective_to_date = TIMESTAMP('", infinity_date, "')"
+  );
+  
+  IF debug_mode THEN
+    SET executed_statements = ARRAY_CONCAT(executed_statements, [STRUCT(step_name, step_sql)]);
+  ELSE
+    -- Log SQL execution start
+    SET execution_id = log_sql_execution(step_name, step_sql);
+    SET step_start_time = CURRENT_TIMESTAMP();
+    
+    INSERT INTO `project_id.framework_dataset.sql_execution_log`
+      (execution_id, batch_id, target_table, process_type, step_name, sql_statement, execution_started)
+    VALUES
+      (execution_id, batch_id, target_table, process_type, step_name, step_sql, step_start_time);
+    
+    -- Execute the SQL
+    EXECUTE IMMEDIATE step_sql;
+    
+    -- Log SQL execution completion
+    SET rows_affected = @@row_count;
+    
+    UPDATE `project_id.framework_dataset.sql_execution_log`
+    SET 
+      execution_completed = CURRENT_TIMESTAMP(),
+      execution_time_ms = TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), step_start_time, MILLISECOND),
+      execution_status = 'SUCCESS',
+      rows_affected = rows_affected
+    WHERE execution_id = execution_id;
+  END IF;
+  
+  -- Insert new and changed records
+  SET step_name = 'INSERT_RECORDS';
+  SET step_sql = CONCAT(
+    "INSERT INTO `", target_table, "` (entity_id, source_key, attributes, effective_from_date, effective_to_date, record_hash, load_date, batch_id) ",
+    "SELECT ",
+    "  entity_id, ",
+    "  source_key, ",
+    "  attributes, ",
+    "  effective_from_date, ",
+    "  effective_to_date, ",
+    "  record_hash, ",
+    "  load_date, ",
+    "  batch_id ",
+    "FROM `project_id.framework_dataset.scd_staging` ",
+    "WHERE target_table = '", target_table, "' ",
+    "AND batch_id = '", batch_id, "' ",
+    "AND action IN ('INSERT', 'UPDATE')"
+  );
+  
+  IF debug_mode THEN
+    SET executed_statements = ARRAY_CONCAT(executed_statements, [STRUCT(step_name, step_sql)]);
+  ELSE
+    -- Log SQL execution start
+    SET execution_id = log_sql_execution(step_name, step_sql);
+    SET step_start_time = CURRENT_TIMESTAMP();
+    
+    INSERT INTO `project_id.framework_dataset.sql_execution_log`
+      (execution_id, batch_id, target_table, process_type, step_name, sql_statement, execution_started)
+    VALUES
+      (execution_id, batch_id, target_table, process_type, step_name, step_sql, step_start_time);
+    
+    -- Execute the SQL
+    EXECUTE IMMEDIATE step_sql;
+    
+    -- Log SQL execution completion
+    SET rows_affected = @@row_count;
+    
+    UPDATE `project_id.framework_dataset.sql_execution_log`
+    SET 
+      execution_completed = CURRENT_TIMESTAMP(),
+      execution_time_ms = TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), step_start_time, MILLISECOND),
+      execution_status = 'SUCCESS',
+      rows_affected = rows_affected
+    WHERE execution_id = execution_id;
+  END IF;
+  
+  -- Update process log
+  SET step_name = 'UPDATE_PROCESS_LOG';
+  SET step_sql = CONCAT(
+    "UPDATE `project_id.framework_dataset.process_log` ",
+    "SET ",
+    "  completed_at = CURRENT_TIMESTAMP(), ",
+    "  last_processed_timestamp = DATETIME(CURRENT_TIMESTAMP()), ",
+    "  records_processed = ", records_processed, ", ",
+    "  records_inserted = ", records_inserted, ", ",
+    "  records_updated = ", records_updated, ", ",
+    "  records_unchanged = ", records_unchanged, ", ",
+    "  status = 'SUCCESS' ",
+    "WHERE process_id = '", process_id, "'"
+  );
+  
+  IF debug_mode THEN
+    SET executed_statements = ARRAY_CONCAT(executed_statements, [STRUCT(step_name, step_sql)]);
+  ELSE
+    -- Log SQL execution start
+    SET execution_id = log_sql_execution(step_name, step_sql);
+    SET step_start_time = CURRENT_TIMESTAMP();
+    
+    INSERT INTO `project_id.framework_dataset.sql_execution_log`
+      (execution_id, batch_id, target_table, process_type, step_name, sql_statement, execution_started)
+    VALUES
+      (execution_id, batch_id, target_table, process_type, step_name, step_sql, step_start_time);
+    
+    -- Execute the SQL
+    EXECUTE IMMEDIATE step_sql;
+    
+    -- Log SQL execution completion
+    SET rows_affected = @@row_count;
+    
+    UPDATE `project_id.framework_dataset.sql_execution_log`
+    SET 
+      execution_completed = CURRENT_TIMESTAMP(),
+      execution_time_ms = TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), step_start_time, MILLISECOND),
+      execution_status = 'SUCCESS',
+      rows_affected = rows_affected
+    WHERE execution_id = execution_id;
+  END IF;
+  
+  -- Insert process summary
+  SET step_name = 'INSERT_PROCESS_SUMMARY';
+  SET step_sql = CONCAT(
+    "INSERT INTO `project_id.framework_dataset.process_summary` (",
+    "  batch_id, ",
+    "  target_table, ",
+    "  run_timestamp, ",
+    "  records_processed, ",
+    "  records_inserted, ",
+    "  records_updated, ",
+    "  records_unchanged, ",
+    "  execution_time_seconds, ",
+    "  process_type, ",
+    "  status, ",
+    "  execution_environment ",
+    ") ",
+    "VALUES (",
+    "  '", batch_id, "', ",
+    "  '", target_table, "', ",
+    "  TIMESTAMP('", start_time, "'), ",
+    "  ", records_processed, ", ",
+    "  ", records_inserted, ", ",
+    "  ", records_updated, ", ",
+    "  ", records_unchanged, ", ",
+    "  TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), TIMESTAMP('", start_time, "'), SECOND), ",
+    "  '", process_type, "', ",
+    "  'SUCCESS', ",
+    "  'BigQuery Stored Procedure' ",
+    ")"
+  );
+  
+  IF debug_mode THEN
+    SET executed_statements = ARRAY_CONCAT(executed_statements, [STRUCT(step_name, step_sql)]);
+  ELSE
+    -- Log SQL execution start
+    SET execution_id = log_sql_execution(step_name, step_sql);
+    SET step_start_time = CURRENT_TIMESTAMP();
+    
+    INSERT INTO `project_id.framework_dataset.sql_execution_log`
+      (execution_id, batch_id, target_table, process_type, step_name, sql_statement, execution_started)
+    VALUES
+      (execution_id, batch_id, target_table, process_type, step_name, step_sql, step_start_time);
+    
+    -- Execute the SQL
+    EXECUTE IMMEDIATE step_sql;
+    
+    -- Log SQL execution completion
+    SET rows_affected = @@row_count;
+    
+    UPDATE `project_id.framework_dataset.sql_execution_log`
+    SET 
+      execution_completed = CURRENT_TIMESTAMP(),
+      execution_time_ms = TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), step_start_time, MILLISECOND),
+      execution_status = 'SUCCESS',
+      rows_affected = rows_affected
+    WHERE execution_id = execution_id;
+  END IF;
+  
+  -- In debug mode, return the SQL statements that would be executed
+  IF debug_mode THEN
+    SELECT 
+      step AS step_name,
+      sql AS sql_statement
+    FROM UNNEST(executed_statements);
+  ELSE
+    -- Return SQL execution summary
+    SELECT
+      step_name,
+      execution_status,
+      rows_affected,
+      execution_time_ms AS execution_time_milliseconds
+    FROM `project_id.framework_dataset.sql_execution_log`
+    WHERE batch_id = batch_id
+    ORDER BY execution_started;
+  END IF;
+
+EXCEPTION WHEN ERROR THEN
+  -- Log error
+  IF NOT debug_mode THEN
+    SET step_name = 'ERROR_HANDLING';
+    SET step_sql = CONCAT(
+      "UPDATE `project_id.framework_dataset.process_log` ",
+      "SET ",
+      "  completed_at = CURRENT_TIMESTAMP(), ",
+      "  status = 'ERROR', ",
+      "  error_message = '", REGEXP_REPLACE(@@error.message, "'", "''"), "' ",
+      "WHERE process_id = '", process_id, "'"
+    );
+    
+    -- Log SQL execution
+    SET execution_id = log_sql_execution(step_name, step_sql);
+    SET step_start_time = CURRENT_TIMESTAMP();
+    
+    INSERT INTO `project_id.framework_dataset.sql_execution_log`
+      (execution_id, batch_id, target_table, process_type, step_name, sql_statement, execution_started)
+    VALUES
+      (execution_id, batch_id, target_table, process_type, step_name, step_sql, step_start_time);
+    
+    -- Execute error logging
+    EXECUTE IMMEDIATE step_sql;
+    
+    -- Log SQL execution completion
+    UPDATE `project_id.framework_dataset.sql_execution_log`
+    SET 
+      execution_completed = CURRENT_TIMESTAMP(),
+      execution_time_ms = TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), step_start_time, MILLISECOND),
+      execution_status = 'SUCCESS'
+    WHERE execution_id = execution_id;
+    
+    -- Insert error summary
+    INSERT INTO `project_id.framework_dataset.process_summary` (
+      batch_id,
+      target_table,
+      run_timestamp,
+      records_processed,
+      records_inserted,
+      records_updated,
+      records_unchanged,
+      execution_time_seconds,
+      process_type,
+      status,
+      error_message,
+      execution_environment
+    )
+    VALUES (
+      batch_id,
+      target_table,
+      start_time,
+      0, 0, 0, 0,
+      TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), start_time, SECOND),
+      process_type,
+      'ERROR',
+      @@error.message,
+      'BigQuery Stored Procedure'
+    );
+  END IF;
+  
+  -- Re-raise the error
+  RAISE USING MESSAGE = @@error.message;
+END;
+
+-- Helper function to view executed SQL for a batch
+CREATE OR REPLACE FUNCTION `project_id.framework_dataset.get_executed_sql`(batch_id_param STRING)
+RETURNS TABLE<
+  step_name STRING,
+  execution_status STRING,
+  execution_time_ms INT64,
+  rows_affected INT64,
+  sql_statement STRING
+>
+AS (
+  SELECT
+    step_name,
+    execution_status,
+    execution_time_ms,
+    rows_affected,
+    sql_statement
+  FROM `project_id.framework_dataset.sql_execution_log`
+  WHERE batch_id = batch_id_param
+  ORDER BY execution_started
+);
+
+-- Example usage with debug mode
+-- CALL `project_id.framework_dataset.process_scd_type2`(
+--   'project_id.dataset_id.AGREEMENT',
+--   'SELECT C.EXTERNAL_CONTRACT_ID AS AGREEMENT_NUMBER, C.FINANCE_COMPANY...',
+--   'AGREEMENT_NUMBER',
+--   ['FINANCE_COMPANY', 'PRODUCT_TYPE',...],
+--   'DELTA',
+--   TRUE  -- Debug mode: returns SQL without executing
+-- );
+
+-- Example to view executed SQL for a batch
+-- SELECT * FROM `project_id.framework_dataset.get_executed_sql`('20230615001');
